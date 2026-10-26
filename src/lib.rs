@@ -94,6 +94,15 @@ fn push_to(stack: &mut Vec<QsFrame>, root: &mut Vec<SemanticNode>, node: Semanti
 
 /// Find `keyword` (case-insensitive) in `trimmed`, then return the
 /// next whitespace-delimited token, stopping at `(`, `<`, `{`, `:`.
+fn declaration_signature(trimmed: &str) -> String {
+    trimmed
+        .split_once('{')
+        .map(|(head, _)| head)
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
+}
+
 fn extract_qs_name(trimmed: &str, keyword: &str) -> String {
     let lower = trimmed.to_lowercase();
     let kw_lower = keyword.to_lowercase();
@@ -224,13 +233,15 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                 let child_idx = stack.last().map(|f| f.children.len()).unwrap_or(0);
                 let id = format!("{}.{}", parent_id, child_idx);
                 let close_depth = depth_before;
+                let signature = declaration_signature(trimmed);
+                let signature_id = format!("{}.0", id);
                 stack.push(QsFrame {
                     id,
                     node_type: "operation",
                     label: name,
                     start_line: lineno,
                     close_depth,
-                    children: vec![],
+                    children: vec![leaf(&signature_id, "qs_signature", &signature, lineno)],
                 });
                 if open_count > 0 && brace_depth <= depth_before {
                     let frame = stack.pop().unwrap();
@@ -255,13 +266,15 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                 let child_idx = stack.last().map(|f| f.children.len()).unwrap_or(0);
                 let id = format!("{}.{}", parent_id, child_idx);
                 let close_depth = depth_before;
+                let signature = declaration_signature(trimmed);
+                let signature_id = format!("{}.0", id);
                 stack.push(QsFrame {
                     id,
                     node_type: "function",
                     label: name,
                     start_line: lineno,
                     close_depth,
-                    children: vec![],
+                    children: vec![leaf(&signature_id, "qs_signature", &signature, lineno)],
                 });
                 if open_count > 0 && brace_depth <= depth_before {
                     let frame = stack.pop().unwrap();
@@ -449,6 +462,21 @@ mod tests {
     fn test_newtype_found() {
         let out = parse_qsharp(SAMPLE);
         intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "newtype", "newtype");
+    }
+
+    #[test]
+    fn operation_parameter_change_is_semantic() {
+        let before = "namespace Demo {\n    operation SayHello() : Unit {\n        Message(\"Hello, World!\");\n    }\n}";
+        let after = "namespace Demo {\n    operation SayHello(name : String) : Unit {\n        Message(\"Hello, World!\");\n    }\n}";
+
+        let before_tree = parse_qsharp(before);
+        let after_tree = parse_qsharp(after);
+
+        assert_ne!(before_tree, after_tree, "operation signature change must alter the semantic tree");
+        assert!(
+            after_tree.contains("qs_signature") && after_tree.contains("name : String"),
+            "operation signature evidence must be retained: {after_tree}"
+        );
     }
 
     #[test]
