@@ -49,8 +49,13 @@ struct QSharpParser;
 // Node helpers
 // ---------------------------------------------------------------------------
 
-fn leaf(id: &str, node_type: &str, label: &str, line: u32) -> SemanticNode {
-    SemanticNodeBuilder::new(id, node_type, label, line, 0, line, 0, String::new()).build()
+fn leaf(id: &str, node_type: &str, label: &str, line: u32, start_col: u32) -> SemanticNode {
+    // The semantic label may be trimmed, but its source range must not be
+    // zero-width. Tree-sitter-free Q# parsing uses exact byte columns.
+    SemanticNodeBuilder::new(
+        id, node_type, label, line, start_col, line,
+        start_col + label.len() as u32, String::new(),
+    ).build()
 }
 
 fn block_node(
@@ -241,7 +246,10 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                     label: name,
                     start_line: lineno,
                     close_depth,
-                    children: vec![leaf(&signature_id, "qs_signature", &signature, lineno)],
+                    children: vec![leaf(
+                        &signature_id, "qs_signature", &signature, lineno,
+                        raw_line.find(&signature).expect("signature occurs in source line") as u32,
+                    )],
                 });
                 if open_count > 0 && brace_depth <= depth_before {
                     let frame = stack.pop().unwrap();
@@ -274,7 +282,10 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                     label: name,
                     start_line: lineno,
                     close_depth,
-                    children: vec![leaf(&signature_id, "qs_signature", &signature, lineno)],
+                    children: vec![leaf(
+                        &signature_id, "qs_signature", &signature, lineno,
+                        raw_line.find(&signature).expect("signature occurs in source line") as u32,
+                    )],
                 });
                 if open_count > 0 && brace_depth <= depth_before {
                     let frame = stack.pop().unwrap();
@@ -298,7 +309,10 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                     .to_string();
                 let child_idx = stack.last().map(|f| f.children.len()).unwrap_or(0);
                 let id = format!("{}.{}", parent_id, child_idx);
-                let n = leaf(&id, "newtype", &name, lineno);
+                let n = leaf(
+                    &id, "newtype", &name, lineno,
+                    raw_line.find(&name).unwrap_or(0) as u32,
+                );
                 push_to(&mut stack, &mut root_children, n);
             }
             _ => {
@@ -309,7 +323,10 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                 if !stmt.is_empty() && !bare_brace {
                     if let Some(frame) = stack.last_mut() {
                         let id = format!("{}.{}", frame.id, frame.children.len());
-                        frame.children.push(leaf(&id, "qs_statement", stmt, lineno));
+                        frame.children.push(leaf(
+                            &id, "qs_statement", stmt, lineno,
+                            raw_line.find(stmt).expect("statement occurs in source line") as u32,
+                        ));
                     }
                 }
             }
