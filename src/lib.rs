@@ -497,6 +497,45 @@ mod tests {
     }
 
     #[test]
+    fn test_changed_operation_signature_anchors_exact_source_token() {
+        let source = "namespace Demo {\n    operation SayHello(name : String) : Unit {\n        Message(\"Hello\");\n    }\n}\n";
+        let parsed: serde_json::Value = serde_json::from_str(&parse_qsharp(source)).unwrap();
+        let signature = &parsed["children"][0]["children"][0]["children"][0];
+        assert_eq!(signature["node_type"], "qs_signature");
+        assert_eq!(signature["position"]["start_line"], 1);
+        assert_eq!(signature["position"]["end_line"], 1);
+        assert_eq!(signature["position"]["start_col"], 4);
+        let label = signature["label"].as_str().unwrap();
+        assert_eq!(label, "operation SayHello(name : String) : Unit");
+        assert_eq!(signature["position"]["end_col"], 4 + label.len());
+        let source_line = source.lines().nth(1).unwrap();
+        let changed_col = source_line.find("name : String").unwrap();
+        assert!(4 <= changed_col);
+        assert!(4 + label.len() >= changed_col + "name : String".len());
+    }
+
+    #[test]
+    fn test_indented_function_and_statement_spans_cover_source() {
+        let source = "namespace Demo {\n    function Twice(n : Int) : Int {\n        return n + n;\n    }\n}\n";
+        let parsed: serde_json::Value = serde_json::from_str(&parse_qsharp(source)).unwrap();
+        let function = &parsed["children"][0]["children"][0];
+        let signature = &function["children"][0];
+        let statement = &function["children"][1];
+        assert_eq!(signature["node_type"], "qs_signature");
+        assert_eq!(signature["position"]["start_line"], 1);
+        assert_eq!(signature["position"]["start_col"], 4);
+        assert_eq!(
+            signature["position"]["end_col"],
+            4 + "function Twice(n : Int) : Int".len(),
+        );
+        assert_eq!(statement["node_type"], "qs_statement");
+        assert_eq!(statement["label"], "return n + n");
+        assert_eq!(statement["position"]["start_line"], 2);
+        assert_eq!(statement["position"]["start_col"], 8);
+        assert_eq!(statement["position"]["end_col"], 8 + "return n + n".len());
+    }
+
+    #[test]
     fn test_internal_operation() {
         let src = "namespace Lib {\n    internal operation Private() : Unit {\n        let x = 1;\n    }\n}";
         let out = parse_qsharp(src);
