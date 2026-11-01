@@ -49,8 +49,13 @@ struct QSharpParser;
 // Node helpers
 // ---------------------------------------------------------------------------
 
-fn leaf(id: &str, node_type: &str, label: &str, line: u32) -> SemanticNode {
-    SemanticNodeBuilder::new(id, node_type, label, line, 0, line, 0, String::new()).build()
+fn leaf(id: &str, node_type: &str, label: &str, line: u32, start_col: u32) -> SemanticNode {
+    // The semantic label may be trimmed, but its source range must not be
+    // zero-width. Tree-sitter-free Q# parsing uses exact byte columns.
+    SemanticNodeBuilder::new(
+        id, node_type, label, line, start_col, line,
+        start_col + label.len() as u32, String::new(),
+    ).build()
 }
 
 fn block_node(
@@ -241,7 +246,10 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                     label: name,
                     start_line: lineno,
                     close_depth,
-                    children: vec![leaf(&signature_id, "qs_signature", &signature, lineno)],
+                    children: vec![leaf(
+                        &signature_id, "qs_signature", &signature, lineno,
+                        raw_line.find(&signature).expect("signature occurs in source line") as u32,
+                    )],
                 });
                 if open_count > 0 && brace_depth <= depth_before {
                     let frame = stack.pop().unwrap();
@@ -274,7 +282,10 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                     label: name,
                     start_line: lineno,
                     close_depth,
-                    children: vec![leaf(&signature_id, "qs_signature", &signature, lineno)],
+                    children: vec![leaf(
+                        &signature_id, "qs_signature", &signature, lineno,
+                        raw_line.find(&signature).expect("signature occurs in source line") as u32,
+                    )],
                 });
                 if open_count > 0 && brace_depth <= depth_before {
                     let frame = stack.pop().unwrap();
@@ -298,7 +309,10 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                     .to_string();
                 let child_idx = stack.last().map(|f| f.children.len()).unwrap_or(0);
                 let id = format!("{}.{}", parent_id, child_idx);
-                let n = leaf(&id, "newtype", &name, lineno);
+                let n = leaf(
+                    &id, "newtype", &name, lineno,
+                    raw_line.find(&name).unwrap_or(0) as u32,
+                );
                 push_to(&mut stack, &mut root_children, n);
             }
             _ => {
@@ -309,7 +323,10 @@ pub(crate) fn parse_qsharp(source: &str) -> String {
                 if !stmt.is_empty() && !bare_brace {
                     if let Some(frame) = stack.last_mut() {
                         let id = format!("{}.{}", frame.id, frame.children.len());
-                        frame.children.push(leaf(&id, "qs_statement", stmt, lineno));
+                        frame.children.push(leaf(
+                            &id, "qs_statement", stmt, lineno,
+                            raw_line.find(stmt).expect("statement occurs in source line") as u32,
+                        ));
                     }
                 }
             }
@@ -477,6 +494,45 @@ mod tests {
             after_tree.contains("qs_signature") && after_tree.contains("name : String"),
             "operation signature evidence must be retained: {after_tree}"
         );
+    }
+
+    #[test]
+    fn test_changed_operation_signature_anchors_exact_source_token() {
+        let source = "namespace Demo {\n    operation SayHello(name : String) : Unit {\n        Message(\"Hello\");\n    }\n}\n";
+        let parsed: serde_json::Value = serde_json::from_str(&parse_qsharp(source)).unwrap();
+        let signature = &parsed["children"][0]["children"][0]["children"][0];
+        assert_eq!(signature["node_type"], "qs_signature");
+        assert_eq!(signature["position"]["start_line"], 1);
+        assert_eq!(signature["position"]["end_line"], 1);
+        assert_eq!(signature["position"]["start_col"], 4);
+        let label = signature["label"].as_str().unwrap();
+        assert_eq!(label, "operation SayHello(name : String) : Unit");
+        assert_eq!(signature["position"]["end_col"], 4 + label.len());
+        let source_line = source.lines().nth(1).unwrap();
+        let changed_col = source_line.find("name : String").unwrap();
+        assert!(4 <= changed_col);
+        assert!(4 + label.len() >= changed_col + "name : String".len());
+    }
+
+    #[test]
+    fn test_indented_function_and_statement_spans_cover_source() {
+        let source = "namespace Demo {\n    function Twice(n : Int) : Int {\n        return n + n;\n    }\n}\n";
+        let parsed: serde_json::Value = serde_json::from_str(&parse_qsharp(source)).unwrap();
+        let function = &parsed["children"][0]["children"][0];
+        let signature = &function["children"][0];
+        let statement = &function["children"][1];
+        assert_eq!(signature["node_type"], "qs_signature");
+        assert_eq!(signature["position"]["start_line"], 1);
+        assert_eq!(signature["position"]["start_col"], 4);
+        assert_eq!(
+            signature["position"]["end_col"],
+            4 + "function Twice(n : Int) : Int".len(),
+        );
+        assert_eq!(statement["node_type"], "qs_statement");
+        assert_eq!(statement["label"], "return n + n");
+        assert_eq!(statement["position"]["start_line"], 2);
+        assert_eq!(statement["position"]["start_col"], 8);
+        assert_eq!(statement["position"]["end_col"], 8 + "return n + n".len());
     }
 
     #[test]
