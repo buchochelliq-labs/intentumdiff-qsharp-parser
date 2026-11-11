@@ -1,14 +1,22 @@
 //! Q# (Microsoft Quantum) parser plugin — full-parse mode.
 //!
-//! Handles `.qs` files using brace-depth tracking.
-//! No tree-sitter grammar is used; this plugin scans for declaration keywords.
+//! Handles `.qs` files with a small lexer (strings, interpolated strings and
+//! `//` comments) and a brace-structured recursive parser. No tree-sitter
+//! grammar is used.
 //!
-//! Semantic nodes produced:
+//! Semantic nodes produced (labels are source tokens with layout/comments
+//! collapsed to single spaces):
 //!   compilation_unit — root
 //!   namespace        — namespace Foo { … } (label = namespace name)
-//!   operation        — operation Bar(…) : T { … } (label = operation name)
-//!   function         — function Baz(…) : T { … } (label = function name)
-//!   newtype          — newtype Complex = (…) (label = type name, leaf)
+//!   operation        — operation Bar(…) : T { … } (label = name; first child qs_signature)
+//!   function         — function Baz(…) : T { … } (label = name; first child qs_signature)
+//!   struct           — struct S { … } (label = name; first child qs_signature)
+//!   newtype          — newtype Complex = (…); (label = name; child qs_signature)
+//!   qs_block         — any other `head { … }` (if/else/for/within/apply/specializations)
+//!   qs_statement     — any `…;` statement or trailing expression
+//!
+//! Unbalanced delimiters or unterminated strings return the in-band
+//! `{"error": …}` envelope rather than a recovered tree.
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 
@@ -46,88 +54,6 @@ fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
 struct QSharpParser;
 
 // ---------------------------------------------------------------------------
-// Node helpers
-// ---------------------------------------------------------------------------
-
-fn leaf(id: &str, node_type: &str, label: &str, line: u32, start_col: u32) -> SemanticNode {
-    // The semantic label may be trimmed, but its source range must not be
-    // zero-width. Tree-sitter-free Q# parsing uses exact byte columns.
-    SemanticNodeBuilder::new(
-        id, node_type, label, line, start_col, line,
-        start_col + label.len() as u32, String::new(),
-    ).build()
-}
-
-fn block_node(
-    id: &str,
-    node_type: &str,
-    label: &str,
-    start: u32,
-    end: u32,
-    children: Vec<SemanticNode>,
-) -> SemanticNode {
-    SemanticNodeBuilder::new(id, node_type, label, start, 0, end, 0, String::new())
-        .children(children)
-        .build()
-}
-
-// ---------------------------------------------------------------------------
-// Stack frame
-// ---------------------------------------------------------------------------
-
-struct QsFrame {
-    id: String,
-    node_type: &'static str,
-    label: String,
-    start_line: u32,
-    /// The frame closes when brace_depth falls to or below this value.
-    close_depth: i32,
-    children: Vec<SemanticNode>,
-}
-
-fn push_to(stack: &mut Vec<QsFrame>, root: &mut Vec<SemanticNode>, node: SemanticNode) {
-    if let Some(parent) = stack.last_mut() {
-        parent.children.push(node);
-    } else {
-        root.push(node);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Name extraction
-// ---------------------------------------------------------------------------
-
-/// Find `keyword` (case-insensitive) in `trimmed`, then return the
-/// next whitespace-delimited token, stopping at `(`, `<`, `{`, `:`.
-fn declaration_signature(trimmed: &str) -> String {
-    trimmed
-        .split_once('{')
-        .map(|(head, _)| head)
-        .unwrap_or(trimmed)
-        .trim()
-        .to_string()
-}
-
-fn extract_qs_name(trimmed: &str, keyword: &str) -> String {
-    let lower = trimmed.to_lowercase();
-    let kw_lower = keyword.to_lowercase();
-    let pos = match lower.find(&*kw_lower) {
-        Some(p) => p + kw_lower.len(),
-        None => return "(anonymous)".to_string(),
-    };
-    let rest = trimmed[pos..].trim_start();
-    let end = rest
-        .find(|c: char| c == '(' || c == '<' || c == '{' || c == ':' || c.is_whitespace())
-        .unwrap_or(rest.len());
-    let name = &rest[..end];
-    if name.is_empty() {
-        "(anonymous)".to_string()
-    } else {
-        name.to_string()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Language detection
 // ---------------------------------------------------------------------------
 
@@ -140,229 +66,413 @@ pub(crate) fn detect_language_impl(filename: &str, _content: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Parser
+// Lexer
 // ---------------------------------------------------------------------------
+//
+// The projection is token based (not line based) so that:
+//   * declarations and bodies on the same line (`function F() : Int { return 1; }`)
+//     are all retained (issue #8);
+//   * `//` inside a quoted string (`"https://a.example"`) is string content, not a
+//     comment (issue #8);
+//   * braces inside strings / interpolations never disturb the structure, and
+//     unbalanced delimiters or unterminated strings produce an explicit in-band
+//     error instead of a recovered tree with clashing node IDs (issue #9).
 
-pub(crate) fn parse_qsharp(source: &str) -> String {
-    let mut root_children: Vec<SemanticNode> = Vec::new();
-    let mut stack: Vec<QsFrame> = Vec::new();
-    let mut counter: usize = 0;
-    let mut brace_depth: i32 = 0;
-    let total_lines = source.lines().count().saturating_sub(1) as u32;
+/// Maximum brace nesting the parser descends into before giving up with an
+/// in-band error (bounded recursion inside the Wasm sandbox).
+const MAX_NESTING: usize = 256;
 
-    for (idx, raw_line) in source.lines().enumerate() {
-        let lineno = idx as u32;
-        let trimmed = raw_line.trim();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokKind {
+    Word,
+    Str,
+    Punct,
+}
 
-        // Strip line comments
-        let trimmed = if let Some(p) = trimmed.find("//") {
-            trimmed[..p].trim()
-        } else {
-            trimmed
-        };
+struct Token<'a> {
+    kind: TokKind,
+    text: &'a str,
+    /// Byte offsets into the source.
+    start: usize,
+    end: usize,
+    /// Whitespace or a comment separated this token from the previous one.
+    spaced: bool,
+}
 
-        if trimmed.is_empty() {
+impl Token<'_> {
+    fn is(&self, punct: &str) -> bool {
+        self.kind == TokKind::Punct && self.text == punct
+    }
+    fn word(&self) -> Option<&str> {
+        (self.kind == TokKind::Word).then_some(self.text)
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '.'
+}
+
+/// Scan a string literal starting at `start` (the opening `"`). For an
+/// interpolated string (`$"…{expr}…"`) braces nest and may contain plain
+/// string literals. Returns the byte offset just past the closing quote.
+fn scan_string(src: &str, start: usize, interpolated: bool) -> Result<usize, String> {
+    let bytes = src.as_bytes();
+    let mut i = start + 1;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' if depth == 0 => return Ok(i + 1),
+            b'"' => i = scan_string(src, i, false)?,
+            b'{' if interpolated => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' if interpolated && depth > 0 => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Err(format!("unterminated string literal starting at byte {start}"))
+}
+
+fn tokenize(src: &str) -> Result<Vec<Token<'_>>, String> {
+    let mut tokens = Vec::new();
+    let mut spaced = false;
+    let mut iter = src.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if c.is_whitespace() {
+            spaced = true;
             continue;
         }
-
-        let depth_before = brace_depth;
-        let open_count = trimmed.chars().filter(|&c| c == '{').count() as i32;
-        let close_count = trimmed.chars().filter(|&c| c == '}').count() as i32;
-        brace_depth += open_count - close_count;
-
-        // Close frames whose close_depth has been reached
-        loop {
-            match stack.last() {
-                Some(f) if f.close_depth >= brace_depth => {
-                    let frame = stack.pop().unwrap();
-                    let n = block_node(
-                        &frame.id,
-                        frame.node_type,
-                        &frame.label,
-                        frame.start_line,
-                        lineno,
-                        frame.children,
-                    );
-                    push_to(&mut stack, &mut root_children, n);
+        let rest = &src[i..];
+        if rest.starts_with("//") {
+            // Line comment (including `///` doc comments): trivia up to newline.
+            while let Some(&(_, n)) = iter.peek() {
+                if n == '\n' {
+                    break;
                 }
-                _ => break,
+                iter.next();
             }
+            spaced = true;
+            continue;
         }
-
-        // Detect declarations
-        let lower = trimmed.to_lowercase();
-        let mut words = lower.split_whitespace();
-        let first_word = words.next().unwrap_or("");
-        let second_word = words.next().unwrap_or("");
-        let keyword_word = if first_word == "internal" {
-            second_word
+        let (kind, end) = if c == '"' {
+            (TokKind::Str, scan_string(src, i, false)?)
+        } else if c == '$' && rest[1..].starts_with('"') {
+            (TokKind::Str, scan_string(src, i + 1, true)?)
+        } else if is_word_char(c) {
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, n)) = iter.peek() {
+                if !is_word_char(n) {
+                    break;
+                }
+                end = j + n.len_utf8();
+                iter.next();
+            }
+            (TokKind::Word, end)
         } else {
-            first_word
+            (TokKind::Punct, i + c.len_utf8())
         };
+        // Skip the characters a string scan consumed.
+        while let Some(&(j, _)) = iter.peek() {
+            if j >= end {
+                break;
+            }
+            iter.next();
+        }
+        tokens.push(Token { kind, text: &src[i..end], start: i, end, spaced });
+        spaced = false;
+    }
+    Ok(tokens)
+}
 
-        match keyword_word {
-            "namespace" => {
-                let name = extract_qs_name(trimmed, "namespace");
-                let id = format!("0.{}", counter);
-                counter += 1;
-                let close_depth = depth_before;
-                stack.push(QsFrame {
-                    id,
+/// Canonical text of a token run: source tokens verbatim, any whitespace or
+/// comment between two tokens collapsed to one space. Layout and comments are
+/// therefore insignificant while every operator, literal and name is kept.
+fn normalized_text(tokens: &[Token<'_>]) -> String {
+    let mut out = String::new();
+    for (n, t) in tokens.iter().enumerate() {
+        if n > 0 && t.spaced {
+            out.push(' ');
+        }
+        out.push_str(t.text);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Structural parser
+// ---------------------------------------------------------------------------
+
+struct Item {
+    node_type: &'static str,
+    label: String,
+    start: usize,
+    end: usize,
+    children: Vec<Item>,
+}
+
+impl Item {
+    fn leaf(node_type: &'static str, tokens: &[Token<'_>]) -> Item {
+        Item {
+            node_type,
+            label: normalized_text(tokens),
+            start: tokens.first().map_or(0, |t| t.start),
+            end: tokens.last().map_or(0, |t| t.end),
+            children: Vec::new(),
+        }
+    }
+}
+
+struct Parser<'a> {
+    tokens: Vec<Token<'a>>,
+    pos: usize,
+}
+
+/// Index of the declaration keyword in `head`, skipping attributes
+/// (`@EntryPoint()`) and access modifiers.
+fn declaration_keyword(head: &[Token<'_>]) -> Option<(usize, &'static str)> {
+    let mut j = 0;
+    while j < head.len() {
+        if head[j].is("@") {
+            j += 2; // `@` + attribute name
+            if head.get(j).is_some_and(|t| t.is("(")) {
+                let mut depth = 0i32;
+                while j < head.len() {
+                    if head[j].is("(") {
+                        depth += 1;
+                    } else if head[j].is(")") {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            continue;
+        }
+        return match head[j].word() {
+            Some("internal") => {
+                j += 1;
+                continue;
+            }
+            Some("namespace") => Some((j, "namespace")),
+            Some("operation") => Some((j, "operation")),
+            Some("function") => Some((j, "function")),
+            Some("newtype") => Some((j, "newtype")),
+            Some("struct") => Some((j, "struct")),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn declaration_name(head: &[Token<'_>], kw: usize) -> String {
+    head.get(kw + 1)
+        .and_then(Token::word)
+        .map_or_else(|| "(anonymous)".to_string(), str::to_string)
+}
+
+impl Parser<'_> {
+    /// Parse items until EOF (`nested == false`) or the matching `}`.
+    /// Returns the items and, for a nested scope, the closing brace's end offset.
+    fn scope(&mut self, depth: usize) -> Result<(Vec<Item>, usize), String> {
+        if depth > MAX_NESTING {
+            return Err(format!("braces nested deeper than {MAX_NESTING} levels"));
+        }
+        let nested = depth > 0;
+        let mut items = Vec::new();
+        loop {
+            let Some(tok) = self.tokens.get(self.pos) else {
+                if nested {
+                    return Err("unclosed '{' at end of input".to_string());
+                }
+                return Ok((items, 0));
+            };
+            if tok.is("}") {
+                if !nested {
+                    return Err(format!("unmatched '}}' at byte {}", tok.start));
+                }
+                let end = tok.end;
+                self.pos += 1;
+                return Ok((items, end));
+            }
+            if tok.is(";") {
+                self.pos += 1;
+                continue;
+            }
+            items.push(self.item(depth)?);
+        }
+    }
+
+    /// Parse one statement, declaration or block starting at `self.pos`.
+    fn item(&mut self, depth: usize) -> Result<Item, String> {
+        let head_start = self.pos;
+        let mut open: Vec<&str> = Vec::new();
+        let terminator = loop {
+            let Some(tok) = self.tokens.get(self.pos) else {
+                if let Some(o) = open.last() {
+                    return Err(format!("unclosed '{o}' at end of input"));
+                }
+                break None;
+            };
+            if tok.kind == TokKind::Punct {
+                match tok.text {
+                    "(" | "[" => open.push(tok.text),
+                    "{" if !open.is_empty() => open.push("{"),
+                    ")" | "]" | "}" if !open.is_empty() => {
+                        let want = match tok.text {
+                            ")" => "(",
+                            "]" => "[",
+                            _ => "{",
+                        };
+                        if open.pop() != Some(want) {
+                            return Err(format!(
+                                "mismatched '{}' at byte {}",
+                                tok.text, tok.start
+                            ));
+                        }
+                    }
+                    ")" | "]" => {
+                        return Err(format!("unmatched '{}' at byte {}", tok.text, tok.start));
+                    }
+                    ";" | "{" | "}" => break Some(tok.text),
+                    _ => {}
+                }
+            }
+            self.pos += 1;
+        };
+        let head_end = self.pos;
+        let head = &self.tokens[head_start..head_end];
+        let keyword = declaration_keyword(head);
+
+        if terminator == Some("{") {
+            self.pos += 1; // consume `{`
+            let (body, close_end) = self.scope(depth + 1)?;
+            let head = &self.tokens[head_start..head_end];
+            let start = head.first().map_or(self.tokens[head_end].start, |t| t.start);
+            let item = match keyword {
+                Some((kw, "namespace")) => Item {
                     node_type: "namespace",
-                    label: name,
-                    start_line: lineno,
-                    close_depth,
-                    children: vec![],
-                });
-                // Same-line close (e.g. namespace Foo {})
-                if open_count > 0 && brace_depth <= depth_before {
-                    let frame = stack.pop().unwrap();
-                    let n = block_node(
-                        &frame.id,
-                        frame.node_type,
-                        &frame.label,
-                        frame.start_line,
-                        lineno,
-                        frame.children,
-                    );
-                    push_to(&mut stack, &mut root_children, n);
-                }
-            }
-            "operation" => {
-                let name = extract_qs_name(trimmed, "operation");
-                let parent_id = stack
-                    .last()
-                    .map(|f| f.id.as_str())
-                    .unwrap_or("0")
-                    .to_string();
-                let child_idx = stack.last().map(|f| f.children.len()).unwrap_or(0);
-                let id = format!("{}.{}", parent_id, child_idx);
-                let close_depth = depth_before;
-                let signature = declaration_signature(trimmed);
-                let signature_id = format!("{}.0", id);
-                stack.push(QsFrame {
-                    id,
-                    node_type: "operation",
-                    label: name,
-                    start_line: lineno,
-                    close_depth,
-                    children: vec![leaf(
-                        &signature_id, "qs_signature", &signature, lineno,
-                        raw_line.find(&signature).expect("signature occurs in source line") as u32,
-                    )],
-                });
-                if open_count > 0 && brace_depth <= depth_before {
-                    let frame = stack.pop().unwrap();
-                    let n = block_node(
-                        &frame.id,
-                        frame.node_type,
-                        &frame.label,
-                        frame.start_line,
-                        lineno,
-                        frame.children,
-                    );
-                    push_to(&mut stack, &mut root_children, n);
-                }
-            }
-            "function" => {
-                let name = extract_qs_name(trimmed, "function");
-                let parent_id = stack
-                    .last()
-                    .map(|f| f.id.as_str())
-                    .unwrap_or("0")
-                    .to_string();
-                let child_idx = stack.last().map(|f| f.children.len()).unwrap_or(0);
-                let id = format!("{}.{}", parent_id, child_idx);
-                let close_depth = depth_before;
-                let signature = declaration_signature(trimmed);
-                let signature_id = format!("{}.0", id);
-                stack.push(QsFrame {
-                    id,
-                    node_type: "function",
-                    label: name,
-                    start_line: lineno,
-                    close_depth,
-                    children: vec![leaf(
-                        &signature_id, "qs_signature", &signature, lineno,
-                        raw_line.find(&signature).expect("signature occurs in source line") as u32,
-                    )],
-                });
-                if open_count > 0 && brace_depth <= depth_before {
-                    let frame = stack.pop().unwrap();
-                    let n = block_node(
-                        &frame.id,
-                        frame.node_type,
-                        &frame.label,
-                        frame.start_line,
-                        lineno,
-                        frame.children,
-                    );
-                    push_to(&mut stack, &mut root_children, n);
-                }
-            }
-            "newtype" => {
-                let name = extract_qs_name(trimmed, "newtype");
-                let parent_id = stack
-                    .last()
-                    .map(|f| f.id.as_str())
-                    .unwrap_or("0")
-                    .to_string();
-                let child_idx = stack.last().map(|f| f.children.len()).unwrap_or(0);
-                let id = format!("{}.{}", parent_id, child_idx);
-                let n = leaf(
-                    &id, "newtype", &name, lineno,
-                    raw_line.find(&name).unwrap_or(0) as u32,
-                );
-                push_to(&mut stack, &mut root_children, n);
-            }
-            _ => {
-                // #46: interior statement lines are review content — operation bodies were
-                // empty shells, so a string edit inside Message(...) hashed style-only.
-                let stmt = trimmed.trim_end_matches(';').trim();
-                let bare_brace = stmt.chars().all(|c| matches!(c, '{' | '}' ) ) ;
-                if !stmt.is_empty() && !bare_brace {
-                    if let Some(frame) = stack.last_mut() {
-                        let id = format!("{}.{}", frame.id, frame.children.len());
-                        frame.children.push(leaf(
-                            &id, "qs_statement", stmt, lineno,
-                            raw_line.find(stmt).expect("statement occurs in source line") as u32,
-                        ));
+                    label: declaration_name(head, kw),
+                    start,
+                    end: close_end,
+                    children: body,
+                },
+                Some((kw, node_type)) => {
+                    let mut children = vec![Item::leaf("qs_signature", head)];
+                    children.extend(body);
+                    Item {
+                        node_type,
+                        label: declaration_name(head, kw),
+                        start,
+                        end: close_end,
+                        children,
                     }
                 }
-            }
+                None => Item {
+                    node_type: "qs_block",
+                    label: if head.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        normalized_text(head)
+                    },
+                    start,
+                    end: close_end,
+                    children: body,
+                },
+            };
+            return Ok(item);
         }
-    }
 
-    // Drain unclosed frames
-    while let Some(frame) = stack.pop() {
-        let n = block_node(
-            &frame.id,
-            frame.node_type,
-            &frame.label,
-            frame.start_line,
-            total_lines,
-            frame.children,
-        );
-        // Don't use push_to here — stack is being drained, push to root
-        root_children.push(n);
+        if terminator == Some(";") {
+            self.pos += 1; // consume `;`
+        }
+        // A `}` terminator is left for the enclosing scope (trailing
+        // expression without `;`, e.g. an implicit return value).
+        Ok(match keyword {
+            Some((kw, node_type)) if node_type != "namespace" => Item {
+                node_type,
+                label: declaration_name(head, kw),
+                start: head[0].start,
+                end: head[head.len() - 1].end,
+                children: vec![Item::leaf("qs_signature", head)],
+            },
+            _ => Item::leaf("qs_statement", head),
+        })
     }
+}
 
-    let root = SemanticNodeBuilder::new(
-        "0",
-        "compilation_unit",
-        "compilation_unit",
-        0,
-        0,
-        total_lines,
-        0,
+// ---------------------------------------------------------------------------
+// SemanticNode conversion
+// ---------------------------------------------------------------------------
+
+struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(src: &str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
+        LineIndex { starts }
+    }
+    /// 0-based line and UTF-8 byte column of a byte offset.
+    fn position(&self, offset: usize) -> (u32, u32) {
+        let line = self.starts.partition_point(|&s| s <= offset).saturating_sub(1);
+        (line as u32, (offset - self.starts[line]) as u32)
+    }
+}
+
+/// IDs are allocated from each node's final position among its parent's
+/// children, so they are unique by construction for any input.
+fn to_node(item: Item, id: &str, lines: &LineIndex) -> SemanticNode {
+    let (start_line, start_col) = lines.position(item.start);
+    let (end_line, end_col) = lines.position(item.end);
+    let children = item
+        .children
+        .into_iter()
+        .enumerate()
+        .map(|(i, child)| to_node(child, &format!("{id}.{i}"), lines))
+        .collect();
+    SemanticNodeBuilder::new(
+        id, item.node_type, item.label, start_line, start_col, end_line, end_col,
         String::new(),
     )
-    .children(root_children)
-    .build();
+    .children(children)
+    .build()
+}
 
-    match serde_json::to_string(&root) {
+fn error_json(message: &str) -> String {
+    serde_json::json!({ "error": format!("qsharp parse error: {message}") }).to_string()
+}
+
+pub(crate) fn parse_qsharp(source: &str) -> String {
+    let tokens = match tokenize(source) {
+        Ok(tokens) => tokens,
+        Err(e) => return error_json(&e),
+    };
+    let mut parser = Parser { tokens, pos: 0 };
+    let items = match parser.scope(0) {
+        Ok((items, _)) => items,
+        Err(e) => return error_json(&e),
+    };
+    let root = Item {
+        node_type: "compilation_unit",
+        label: "compilation_unit".to_string(),
+        start: 0,
+        end: source.len(),
+        children: items,
+    };
+    let lines = LineIndex::new(source);
+    match serde_json::to_string(&to_node(root, "0", &lines)) {
         Ok(s) => s,
-        Err(e) => format!(r#"{{"error":"Serialisation error: {}"}}"#, e),
+        Err(e) => error_json(&format!("serialisation error: {e}")),
     }
 }
 
@@ -552,5 +662,240 @@ mod tests {
         intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "namespace", "labels");
         intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "operation", "labels");
         intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "function", "labels");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression helpers
+    // -----------------------------------------------------------------------
+
+    fn tree(src: &str) -> serde_json::Value {
+        let out = parse_qsharp(src);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_none(), "unexpected error for {src:?}: {out}");
+        v
+    }
+
+    fn root_hash(src: &str) -> String {
+        tree(src)["structural_hash"].as_str().unwrap().to_string()
+    }
+
+    fn find_label<'a>(node: &'a serde_json::Value, node_type: &str, label: &str) -> Option<&'a serde_json::Value> {
+        if node["node_type"] == node_type && node["label"] == label {
+            return Some(node);
+        }
+        node["children"].as_array()?.iter().find_map(|c| find_label(c, node_type, label))
+    }
+
+    fn collect_ids(node: &serde_json::Value, out: &mut Vec<String>) {
+        out.push(node["id"].as_str().unwrap().to_string());
+        for c in node["children"].as_array().unwrap() {
+            collect_ids(c, out);
+        }
+    }
+
+    fn assert_unique_ids(v: &serde_json::Value) {
+        let mut ids = Vec::new();
+        collect_ids(v, &mut ids);
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate ids: {ids:?}");
+    }
+
+    fn assert_semantic_change(old: &str, new: &str, node_type: &str, new_label: &str) {
+        assert_ne!(root_hash(old), root_hash(new), "{old:?} -> {new:?} must change the tree");
+        let t = tree(new);
+        assert!(
+            find_label(&t, node_type, new_label).is_some(),
+            "missing {node_type} {new_label:?} in {t}"
+        );
+    }
+
+    fn assert_error(src: &str) {
+        let out = parse_qsharp(src);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").and_then(|e| e.as_str()).is_some(), "expected error envelope for {src:?}: {out}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #8: inline bodies and `//` inside quoted strings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn issue8_inline_operation_body_literal() {
+        assert_semantic_change(
+            "operation F() : Int { return 1; }\n",
+            "operation F() : Int { return 2; }\n",
+            "qs_statement",
+            "return 2",
+        );
+    }
+
+    #[test]
+    fn issue8_quoted_comment_marker_multiline() {
+        assert_semantic_change(
+            "operation F() : Unit {\n  Message(\"https://safe\");\n}\n",
+            "operation F() : Unit {\n  Message(\"https://danger\");\n}\n",
+            "qs_statement",
+            "Message(\"https://danger\")",
+        );
+    }
+
+    #[test]
+    fn assessment_literal_value() {
+        assert_semantic_change(
+            "namespace Probe { function Answer() : Int { return 1; } }\n",
+            "namespace Probe { function Answer() : Int { return 2; } }\n",
+            "qs_statement",
+            "return 2",
+        );
+    }
+
+    #[test]
+    fn assessment_declaration_api() {
+        assert_semantic_change(
+            "namespace Probe { function Answer() : Int { return 1; } }\n",
+            "namespace Probe { function ResultValue() : Int { return 1; } }\n",
+            "function",
+            "ResultValue",
+        );
+    }
+
+    #[test]
+    fn assessment_body_operator() {
+        assert_semantic_change(
+            "namespace Probe { function Combine(a : Int, b : Int) : Int { return a + b; } }\n",
+            "namespace Probe { function Combine(a : Int, b : Int) : Int { return a - b; } }\n",
+            "qs_statement",
+            "return a - b",
+        );
+    }
+
+    #[test]
+    fn assessment_unicode_payload_spans_are_utf8_bytes() {
+        let new = "namespace Probe { function MessageText() : String { return \"cafe\u{96ea}\"; } }\n";
+        assert_semantic_change(
+            "namespace Probe { function MessageText() : String { return \"caf\u{e9}\"; } }\n",
+            new,
+            "qs_statement",
+            "return \"cafe\u{96ea}\"",
+        );
+        let t = tree(new);
+        let stmt = find_label(&t, "qs_statement", "return \"cafe\u{96ea}\"").unwrap();
+        let start = new.find("return").unwrap();
+        let end = new.find("\";").unwrap() + 1;
+        assert_eq!(stmt["position"]["start_line"], 0);
+        assert_eq!(stmt["position"]["start_col"], start);
+        assert_eq!(stmt["position"]["end_col"], end);
+    }
+
+    #[test]
+    fn assessment_quoted_comment_marker_inline() {
+        let new = "namespace Probe { function Url() : String { return \"https://b.example\"; } }\n";
+        assert_semantic_change(
+            "namespace Probe { function Url() : String { return \"https://a.example\"; } }\n",
+            new,
+            "qs_statement",
+            "return \"https://b.example\"",
+        );
+        // The brace after the string must still close the function and namespace.
+        let t = tree(new);
+        assert_eq!(t["children"].as_array().unwrap().len(), 1);
+        assert_eq!(t["children"][0]["node_type"], "namespace");
+        assert_eq!(t["children"][0]["children"][0]["node_type"], "function");
+    }
+
+    #[test]
+    fn inline_and_multiline_bodies_have_same_semantics() {
+        let inline = "namespace Probe { function Answer() : Int { return 1; } }\n";
+        let multi = "namespace Probe {\n    function Answer() : Int {\n        return 1;\n    }\n}\n";
+        assert_eq!(root_hash(inline), root_hash(multi));
+    }
+
+    #[test]
+    fn comments_and_layout_are_insignificant() {
+        let base = "namespace Probe { function Answer() : Int { return 1; } }\n";
+        assert_eq!(root_hash(base), root_hash("// Ordinary comment\nnamespace Probe { function Answer() : Int { return 1; } }\n"));
+        assert_eq!(root_hash(base), root_hash("\nnamespace Probe { function Answer() : Int { return 1; } }\n\n"));
+        assert_eq!(
+            root_hash(base),
+            root_hash("namespace Probe { function Answer() : Int { return 1; // trailing } {\n } }\n")
+        );
+    }
+
+    #[test]
+    fn braces_in_interpolated_strings_do_not_affect_structure() {
+        let src = "namespace Demo {\n    operation SayHello(name : String) : Unit {\n        Message($\"Hello, {name}! }}\");\n    }\n}\n";
+        let t = tree(src);
+        assert!(find_label(&t, "qs_statement", "Message($\"Hello, {name}! }}\")").is_some(), "{t}");
+        assert_unique_ids(&t);
+    }
+
+    #[test]
+    fn nested_block_boundaries_are_structural() {
+        let a = "operation F() : Unit { if c { X(q); } Y(q); }";
+        let b = "operation F() : Unit { if c { X(q); Y(q); } }";
+        assert_ne!(root_hash(a), root_hash(b));
+        assert!(find_label(&tree(a), "qs_block", "if c").is_some());
+    }
+
+    #[test]
+    fn newtype_definition_change_is_semantic() {
+        assert_ne!(
+            root_hash("newtype Complex = (Real : Double, Imag : Double);"),
+            root_hash("newtype Complex = (Real : Double, Imag : Int);"),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #9: unique IDs or explicit errors for malformed declarations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn issue9_fuzz_002_returns_error_envelope() {
+        assert_error("namespace Demo {\n    open Microsoft.Quantum.Intrinsic;\n    open Microsoft.Quantum.Canon;\n\n    operation Sayllo, {name}!\");\n    }\n\n    operation FlipBit() : Result {\n        use q = Qubit();\n        X(q);\n        let result = M(q);\n        Reset(q);\n        return result;\n    }\n}\n");
+    }
+
+    #[test]
+    fn issue9_malformed_inputs_error_explicitly() {
+        assert_error("namespace Probe { function Answer(\n");
+        assert_error("operation A() : Unit { }\n}\noperation B() : Unit { }\n");
+        assert_error("operation A() : Unit { X(q]; }");
+        assert_error("function F() : String { return \"open; }");
+        assert_error(&"{".repeat(1000));
+    }
+
+    #[test]
+    fn issue9_multiple_root_declarations_have_unique_ids() {
+        let src = "operation A() : Unit { X(q); }\noperation B() : Unit { Y(q); }\nnewtype P = (Int, Int);\nnewtype Q = Int;\nfunction C() : Int { return \"}\" == \"{\" ? 1 | 2; }\n";
+        let t = tree(src);
+        assert_unique_ids(&t);
+        assert_eq!(t["children"].as_array().unwrap().len(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #5: modified signature has a non-empty source span
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn issue5_signature_span_covers_inserted_parameter() {
+        let src = "namespace Demo {\n    open Microsoft.Quantum.Intrinsic;\n\n    operation SayHello(name : String) : Unit {\n        Message(\"Hello, World!\");\n    }\n}\n";
+        let t = tree(src);
+        let sig = find_label(&t, "qs_signature", "operation SayHello(name : String) : Unit").unwrap();
+        let line = src.lines().nth(3).unwrap();
+        assert_eq!(sig["position"]["start_line"], 3);
+        assert_eq!(sig["position"]["end_line"], 3);
+        assert_eq!(sig["position"]["start_col"], 4);
+        assert_eq!(sig["position"]["end_col"], line.find(" {").unwrap());
+        let op = find_label(&t, "operation", "SayHello").unwrap();
+        assert_eq!(op["position"]["start_line"], 3);
+        assert_eq!(op["position"]["start_col"], 4);
+        assert_eq!(op["position"]["end_line"], 5);
+        assert_eq!(op["position"]["end_col"], 5);
+    }
+
+    #[test]
+    fn output_is_deterministic() {
+        assert_eq!(parse_qsharp(SAMPLE), parse_qsharp(SAMPLE));
     }
 }
