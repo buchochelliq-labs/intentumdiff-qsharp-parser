@@ -113,9 +113,24 @@ fn is_word_char(c: char) -> bool {
 }
 
 /// Scan a string literal starting at `start` (the opening `"`). For an
-/// interpolated string (`$"…{expr}…"`) braces nest and may contain plain
-/// string literals. Returns the byte offset just past the closing quote.
+/// interpolated string (`$"…{expr}…"`) braces nest and may contain plain or
+/// interpolated string literals. Returns the byte offset just past the
+/// closing quote.
 fn scan_string(src: &str, start: usize, interpolated: bool) -> Result<usize, String> {
+    scan_string_nested(src, start, interpolated, 0)
+}
+
+fn scan_string_nested(
+    src: &str,
+    start: usize,
+    interpolated: bool,
+    nesting: usize,
+) -> Result<usize, String> {
+    if nesting > MAX_NESTING {
+        return Err(format!(
+            "interpolated strings nested deeper than {MAX_NESTING} levels"
+        ));
+    }
     let bytes = src.as_bytes();
     let mut i = start + 1;
     let mut depth = 0usize;
@@ -123,7 +138,12 @@ fn scan_string(src: &str, start: usize, interpolated: bool) -> Result<usize, Str
         match bytes[i] {
             b'\\' => i += 2,
             b'"' if depth == 0 => return Ok(i + 1),
-            b'"' => i = scan_string(src, i, false)?,
+            // A string inside an interpolation hole: `$"` keeps
+            // interpolation mode so its own holes balance (#11).
+            b'"' => {
+                let nested = bytes[i - 1] == b'$';
+                i = scan_string_nested(src, i, nested, nesting + 1)?;
+            }
             b'{' if interpolated => {
                 depth += 1;
                 i += 1;
@@ -135,7 +155,9 @@ fn scan_string(src: &str, start: usize, interpolated: bool) -> Result<usize, Str
             _ => i += 1,
         }
     }
-    Err(format!("unterminated string literal starting at byte {start}"))
+    Err(format!(
+        "unterminated string literal starting at byte {start}"
+    ))
 }
 
 fn tokenize(src: &str) -> Result<Vec<Token<'_>>, String> {
@@ -829,6 +851,41 @@ mod tests {
         let t = tree(src);
         assert!(find_label(&t, "qs_statement", "Message($\"Hello, {name}! }}\")").is_some(), "{t}");
         assert_unique_ids(&t);
+    }
+
+    // Issue #11: a nested interpolated string keeps interpolation mode.
+    #[test]
+    fn nested_interpolated_strings_balance_their_holes() {
+        let src = "operation F() : Unit { Message($\"{$\"{ \"}\" }\"}\"); }";
+        let t = tree(src);
+        let mut ops = Vec::new();
+        fn collect(n: &serde_json::Value, ty: &str, out: &mut Vec<String>) {
+            if n["node_type"] == ty {
+                out.push(n["label"].as_str().unwrap().to_string());
+            }
+            for c in n["children"].as_array().into_iter().flatten() {
+                collect(c, ty, out);
+            }
+        }
+        collect(&t, "operation", &mut ops);
+        assert_eq!(ops.len(), 1, "{t}");
+        assert!(
+            find_label(&t, "qs_statement", "Message($\"{$\"{ \"}\" }\"}\")").is_some(),
+            "{t}"
+        );
+        assert_unique_ids(&t);
+        // A plain nested `"}"` inside a hole is still a literal.
+        let plain = "operation F() : Unit { Message($\"{ \"}\" }\"); }";
+        assert!(
+            find_label(&tree(plain), "qs_statement", "Message($\"{ \"}\" }\")").is_some()
+        );
+        // Deeply nested interpolations are bounded with an explicit error.
+        let deep = format!(
+            "operation F() : Unit {{ Message({}x{}); }}",
+            "$\"{".repeat(400),
+            "}\"".repeat(400)
+        );
+        assert_error(&deep);
     }
 
     #[test]
